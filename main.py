@@ -1,3 +1,12 @@
+import os
+import sys
+
+# Safeguard against PyInstaller's --noconsole setting sys.stderr/sys.stdout to None
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+    
 import asyncio
 import json
 import os
