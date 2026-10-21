@@ -6,9 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from loguru import logger
-
-from main import build_result, describe_login_failure, ensure_account, parse_tweet_id, scrape_and_save
+from main import build_result, ensure_account, parse_tweet_id, scrape_and_save
 
 
 def make_tweet(tweet_id: int, likes: int = 0, retweets: int = 0):
@@ -73,99 +71,38 @@ class MainTests(unittest.TestCase):
         api = SimpleNamespace(
             pool=SimpleNamespace(
                 accounts_info=AsyncMock(return_value=[{"username": "friend", "active": True}]),
-                add_account=AsyncMock(),
-                login_all=AsyncMock(),
+                add_account_cookies=AsyncMock(),
             )
         )
-        asyncio.run(ensure_account(api, "friend", "", "", "", lambda _: None))
-        api.pool.add_account.assert_not_awaited()
-        api.pool.login_all.assert_not_awaited()
+        asyncio.run(ensure_account(api, "friend", "auth_token=abc; ct0=123", lambda _: None))
+        api.pool.add_account_cookies.assert_not_awaited()
 
-    def test_ensure_account_registers_and_logs_in_first_account(self):
+    def test_ensure_account_adds_cookies_for_new_account(self):
         api = SimpleNamespace(
             pool=SimpleNamespace(
                 accounts_info=AsyncMock(return_value=[]),
-                add_account=AsyncMock(),
-                login_all=AsyncMock(return_value={"success": 1}),
+                add_account_cookies=AsyncMock(),
             )
         )
-        asyncio.run(ensure_account(api, "friend", "x-pass", "friend@example.com", "email-pass", lambda _: None))
-        api.pool.add_account.assert_awaited_once_with("friend", "x-pass", "friend@example.com", "email-pass")
-        api.pool.login_all.assert_awaited_once_with(["friend"])
+        asyncio.run(ensure_account(api, "friend", "auth_token=abc; ct0=123", lambda _: None))
+        api.pool.add_account_cookies.assert_awaited_once_with("friend", "auth_token=abc; ct0=123")
 
     def test_ensure_account_replaces_inactive_saved_credentials(self):
         api = SimpleNamespace(
             pool=SimpleNamespace(
                 accounts_info=AsyncMock(return_value=[{"username": "friend", "active": False}]),
                 delete_accounts=AsyncMock(),
-                add_account=AsyncMock(),
-                login_all=AsyncMock(return_value={"success": 1}),
+                add_account_cookies=AsyncMock(),
             )
         )
-        asyncio.run(ensure_account(api, "friend", "new-pass", "friend@example.com", "email-pass", lambda _: None))
+        asyncio.run(ensure_account(api, "friend", "auth_token=abc; ct0=123", lambda _: None))
         api.pool.delete_accounts.assert_awaited_once_with("friend")
-        api.pool.add_account.assert_awaited_once_with("friend", "new-pass", "friend@example.com", "email-pass")
+        api.pool.add_account_cookies.assert_awaited_once_with("friend", "auth_token=abc; ct0=123")
 
-    def test_ensure_account_requires_verification_credentials(self):
+    def test_ensure_account_requires_cookies(self):
         api = SimpleNamespace(pool=SimpleNamespace(accounts_info=AsyncMock(return_value=[])))
-        with self.assertRaisesRegex(ValueError, "email app password"):
-            asyncio.run(ensure_account(api, "friend", "", "", "", lambda _: None))
-
-    def test_login_failure_diagnostics_are_categorized_and_redacted(self):
-        diagnostic = describe_login_failure(
-            "login_step=LoginAcid err=ProxyError https://proxy.internal.example:8080 secret=hidden"
-        )
-        self.assertIn("corporate proxy", diagnostic)
-        self.assertNotIn("proxy.internal.example", diagnostic)
-        self.assertNotIn("hidden", diagnostic)
-        self.assertIn("IMAP", describe_login_failure("login_step=LoginAcid err=IMAP authentication failed"))
-        self.assertIn("rate-limited", describe_login_failure("HTTP 429"))
-
-    def test_cloudflare_block_is_not_misreported_as_bad_credentials(self):
-        response = (
-            "403 - <title>Attention Required! | Cloudflare</title>"
-            "<h2>Sorry, you have been blocked</h2>"
-            "Cloudflare Ray ID: <strong class=\"font-semibold\">a4e0cdbe8994fab7</strong>"
-            "Your IP: 203.0.113.10"
-        )
-        diagnostic = describe_login_failure(response)
-        self.assertIn("does not indicate an incorrect password", diagnostic)
-        self.assertIn("a4e0cdbe8994fab7", diagnostic)
-        self.assertNotIn("203.0.113.10", diagnostic)
-
-    def test_ensure_account_surfaces_sanitized_login_failure(self):
-        api = SimpleNamespace(
-            pool=SimpleNamespace(
-                accounts_info=AsyncMock(return_value=[]),
-                add_account=AsyncMock(),
-                login_all=AsyncMock(return_value={"success": 0}),
-                get=AsyncMock(
-                    return_value=SimpleNamespace(error_msg="login_step=LoginJsInstrumentationSubtask SSL certificate error")
-                ),
-            )
-        )
-        with self.assertRaisesRegex(RuntimeError, "network or TLS") as failure:
-            asyncio.run(ensure_account(api, "friend", "x-pass", "friend@example.com", "email-pass", lambda _: None))
-        self.assertNotIn("x-pass", str(failure.exception))
-        api.pool.get.assert_awaited_once_with("friend")
-
-    def test_ensure_account_captures_and_redacts_twscrape_http_failure(self):
-        async def failed_login(_usernames):
-            logger.error("Failed to login 'friend': 407 - proxy.internal.example:8080 credential=x-pass")
-            return {"success": 0}
-
-        api = SimpleNamespace(
-            pool=SimpleNamespace(
-                accounts_info=AsyncMock(return_value=[]),
-                add_account=AsyncMock(),
-                login_all=AsyncMock(side_effect=failed_login),
-                get=AsyncMock(return_value=SimpleNamespace(error_msg=None)),
-            )
-        )
-        with self.assertRaisesRegex(RuntimeError, "proxy requires authentication") as failure:
-            asyncio.run(ensure_account(api, "friend", "x-pass", "friend@example.com", "email-pass", lambda _: None))
-        self.assertNotIn("proxy.internal.example", str(failure.exception))
-        self.assertNotIn("x-pass", str(failure.exception))
+        with self.assertRaisesRegex(ValueError, "Browser cookies are required"):
+            asyncio.run(ensure_account(api, "friend", "", lambda _: None))
 
 
 if __name__ == "__main__":
