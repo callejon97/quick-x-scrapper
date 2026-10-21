@@ -18,6 +18,12 @@ from twscrape import API, gather
 
 logger.remove()
 
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 
 def parse_tweet_id(value: str) -> str:
     value = value.strip()
@@ -75,58 +81,59 @@ def build_result(source_tweet, quotes: list, replies: list) -> dict:
     }
 
 
-def describe_login_failure(error: str | None) -> str:
-    if not error:
-        return "No diagnostic was recorded. Check X account details and try again."
-
-    normalized = error.casefold()
-    stage_match = re.search(r"login_step=([a-z0-9_]+)", normalized)
-    stage = f" during {stage_match.group(1)}" if stage_match else ""
-
-    if any(term in normalized for term in ("attention required! | cloudflare", "you have been blocked", "cloudflare ray id:")):
-        ray_match = re.search(r"cloudflare ray id:\s*<strong[^>]*>\s*([a-f0-9]+)", normalized)
-        ray_id = f" Cloudflare Ray ID: {ray_match.group(1)}." if ray_match else ""
-        return (
-            "X returned a Cloudflare block page (HTTP 403) before sign-in; this does not indicate an incorrect "
-            "password. Stop retrying for now. Ask corporate IT whether network policy, proxying, or TLS inspection "
-            "is involved. If it is not, contact X support with the Ray ID."
-            f"{ray_id}"
+def fetch_cookies_via_browser(status_callback: Callable[[str], None]) -> tuple[str, str]:
+    if not PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError(
+            "Playwright is required for automatic browser login. Please run:\n"
+            "pip install playwright && playwright install chromium"
         )
 
-    status_match = re.search(r"\b(400|401|403|407|429|5\d\d)\b", error)
-    if status_match:
-        status_code = status_match.group(1)
-        if status_code == "407":
-            return "The network proxy requires authentication or denied the connection. Check with corporate IT."
-        if status_code == "429":
-            return "X rate-limited the sign-in. Wait before trying again."
-        if status_code in {"401", "403"}:
-            return "X rejected or challenged the sign-in. Verify the account details and check whether X requires another verification step."
-        return f"X or a network gateway returned an HTTP {status_code} error during sign-in. Check with corporate IT if this persists."
-
-    if any(term in normalized for term in ("proxy", "407", "connecterror", "connecttimeout", "readtimeout", "timed out", "network is unreachable", "connection refused", "ssl", "certificate", "dns")):
-        return (
-            f"A network or TLS connection failed{stage}. A corporate proxy, firewall, DNS policy, or TLS inspection "
-            "may be involved. The app does not change network or proxy settings; ask IT whether X and the email "
-            "provider are reachable under your organization's policy."
+    status_callback("Launching browser for manual login...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False, args=["--disable-blink-features=AutomationControlled"])
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
-    if any(term in normalized for term in ("imap", "email", "loginacid")):
-        return (
-            f"Email verification failed{stage}. Check that IMAP is enabled and the email app password is correct; "
-            "corporate policy may restrict IMAP access."
-        )
-    if any(term in normalized for term in ("mfa", "two-factor", "two factor", "authenticator")):
-        return "This account appears to require authenticator-based verification, which this app does not currently support."
+        page = context.new_page()
+        page.goto("https://x.com/login")
 
-    return f"X sign-in failed{stage}. The raw server response is hidden to avoid exposing account or corporate network details."
+        status_callback("Please log in to X in the opened browser window...")
+        
+        auth_token = None
+        ct0 = None
+        username = None
+
+        # Wait up to 5 minutes for successful login
+        for _ in range(300):
+            cookies = context.cookies("https://x.com")
+            cookie_dict = {c["name"]: c["value"] for c in cookies}
+            auth_token = cookie_dict.get("auth_token")
+            ct0 = cookie_dict.get("ct0")
+            
+            if auth_token and ct0:
+                # Try to extract the username from local storage or URL / page state if possible, or fallback
+                try:
+                    # Look for username in cookies or page elements if available
+                    pass
+                except Exception:
+                    pass
+                break
+            import time
+            time.sleep(1)
+
+        browser.close()
+
+        if not auth_token or not ct0:
+            raise RuntimeError("Login timed out or session cookies were not captured.")
+
+        cookie_string = f"auth_token={auth_token}; ct0={ct0}"
+        return cookie_string
 
 
 async def ensure_account(
     api: API,
     username: str,
-    password: str,
-    email: str,
-    email_password: str,
+    cookie_string: str,
     status: Callable[[str], None],
 ) -> None:
     accounts = await api.pool.accounts_info()
@@ -135,35 +142,15 @@ async def ensure_account(
         status(f"Using saved session for @{username}.")
         return
 
-    if not all((password, email, email_password)):
-        raise ValueError(
-            "First-time sign-in needs your X password, email address, and email app password. "
-            "The email app password lets twscrape retrieve verification codes over IMAP."
-        )
+    if not cookie_string.strip():
+        raise ValueError("Browser cookies are required. Use 'Log in via Browser' to capture them.")
 
-    status("Signing in to X. This can take a minute...")
+    status("Saving session cookies...")
     if existing:
         await api.pool.delete_accounts(username)
-    await api.pool.add_account(username, password, email, email_password)
-    login_errors = []
-    sink_id = logger.add(
-        login_errors.append,
-        format="{message}",
-        filter=lambda record: record["message"].startswith("Failed to login"),
-        level="ERROR",
-    )
-    try:
-        result = await api.pool.login_all([username])
-    finally:
-        logger.remove(sink_id)
-    if result["success"] == 0:
-        try:
-            account = await api.pool.get(username)
-            error = account.error_msg or (login_errors[-1] if login_errors else None)
-        except Exception:
-            error = login_errors[-1] if login_errors else None
-        raise RuntimeError(describe_login_failure(error))
-    status("Sign-in complete. Your session is saved on this computer.")
+    
+    await api.pool.add_account_cookies(username, cookie_string)
+    status("Session cookies registered successfully.")
 
 
 async def scrape_and_save(api: API, tweet_id: str, output_file: Path, status: Callable[[str], None]) -> Path:
@@ -195,14 +182,12 @@ class ScraperApp:
         self.running = False
         self.output_directory = tk.StringVar(value=str(Path.home() / "Documents" / "TweetThreadScraper"))
         self.username = tk.StringVar()
-        self.password = tk.StringVar()
-        self.email = tk.StringVar()
-        self.email_password = tk.StringVar()
+        self.cookies = tk.StringVar()
         self.tweet = tk.StringVar()
 
         root.title("Tweet Thread Scraper")
-        root.geometry("620x620")
-        root.minsize(560, 560)
+        root.geometry("620x680")
+        root.minsize(560, 600)
         self._configure_style()
         self._build_interface()
         self.root.after(100, self._process_events)
@@ -217,6 +202,7 @@ class ScraperApp:
         style.configure("Card.TLabelframe", background="#ffffff", padding=14)
         style.configure("Card.TLabelframe.Label", background="#ffffff", foreground="#18232e", font=("TkDefaultFont", 10, "bold"))
         style.configure("Primary.TButton", font=("TkDefaultFont", 10, "bold"), padding=(14, 9))
+        style.configure("Secondary.TButton", font=("TkDefaultFont", 10), padding=(10, 6))
         style.configure("Status.TLabel", background="#f4f6f8", foreground="#53616f")
 
     def _build_interface(self) -> None:
@@ -229,21 +215,27 @@ class ScraperApp:
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(4, 18))
 
-        account = ttk.LabelFrame(shell, text="X account", style="Card.TLabelframe", labelanchor="nw")
+        account = ttk.LabelFrame(shell, text="X account session", style="Card.TLabelframe", labelanchor="nw")
         account.pack(fill="x", pady=(0, 14))
         account.columnconfigure(1, weight=1)
+        
         self._field(account, "Username", self.username, 0)
-        self._field(account, "X password", self.password, 1, show="*")
-        self._field(account, "Email address", self.email, 2)
-        self._field(account, "Email app password", self.email_password, 3, show="*")
+        self._field(account, "Cookies string", self.cookies, 1, show="*")
+
+        btn_frame = ttk.Frame(account, style="App.TFrame")
+        btn_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        
+        login_btn = ttk.Button(btn_frame, text="Log in via Browser & Fetch Cookies", style="Secondary.TButton", command=self._browser_login)
+        login_btn.pack(anchor="w")
+
         ttk.Label(
             account,
-            text="Needed only for first sign-in. IMAP access is used for email verification codes.",
+            text="Click the button above to launch a browser, log in manually, and automatically grab your session cookies.",
             wraplength=500,
             justify="left",
             background="#ffffff",
             foreground="#53616f",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         target = ttk.LabelFrame(shell, text="Post to scrape", style="Card.TLabelframe", labelanchor="nw")
         target.pack(fill="x", pady=(0, 14))
@@ -263,12 +255,6 @@ class ScraperApp:
         self.progress.pack(fill="x", pady=(16, 8))
         self.status = tk.StringVar(value="Ready")
         ttk.Label(shell, textvariable=self.status, style="Status.TLabel", wraplength=550).pack(anchor="w")
-        ttk.Label(
-            shell,
-            text="twscrape stores account credentials and session data locally on this computer.",
-            style="Subtitle.TLabel",
-            wraplength=550,
-        ).pack(anchor="w", side="bottom", pady=(16, 0))
 
     @staticmethod
     def _field(parent, label: str, variable: tk.StringVar, row: int, show: str | None = None) -> None:
@@ -280,6 +266,23 @@ class ScraperApp:
         if selected:
             self.output_directory.set(selected)
 
+    def _browser_login(self) -> None:
+        if self.running:
+            return
+        self.running = True
+        self.start_button.state(["disabled"])
+        self.progress.start(10)
+        self.status.set("Opening browser for login...")
+
+        def run_browser_thread():
+            try:
+                cookie_str = fetch_cookies_via_browser(lambda msg: self.events.put(("status", msg)))
+                self.events.put(("cookies_fetched", cookie_str))
+            except Exception as error:
+                self.events.put(("error", str(error) or error.__class__.__name__))
+
+        threading.Thread(target=run_browser_thread, daemon=True).start()
+
     def _start(self) -> None:
         if self.running:
             return
@@ -290,7 +293,11 @@ class ScraperApp:
             return
         username = self.username.get().strip().lstrip("@")
         if not username:
-            messagebox.showerror("Username required", "Enter the X username for the account to use.", parent=self.root)
+            messagebox.showerror("Username required", "Enter your X username.", parent=self.root)
+            return
+        cookie_string = self.cookies.get().strip()
+        if not cookie_string:
+            messagebox.showerror("Cookies required", "Click 'Log in via Browser' to capture your session cookies first.", parent=self.root)
             return
         directory_text = self.output_directory.get().strip()
         if not directory_text:
@@ -302,15 +309,15 @@ class ScraperApp:
         self.start_button.state(["disabled"])
         self.progress.start(10)
         self.status.set("Preparing scrape...")
-        credentials = (username, self.password.get(), self.email.get().strip(), self.email_password.get())
+        credentials = (username, cookie_string)
         threading.Thread(
             target=self._run_job,
             args=(tweet_id, credentials, output_directory),
             daemon=True,
         ).start()
 
-    def _run_job(self, tweet_id: str, credentials: tuple[str, str, str, str], output_directory: Path) -> None:
-        username, password, email, email_password = credentials
+    def _run_job(self, tweet_id: str, credentials: tuple[str, str], output_directory: Path) -> None:
+        username, cookie_string = credentials
         try:
             app_data = user_data_directory()
             app_data.mkdir(parents=True, exist_ok=True)
@@ -324,7 +331,7 @@ class ScraperApp:
                 def report_status(message: str) -> None:
                     self.events.put(("status", message))
 
-                await ensure_account(api, username, password, email, email_password, report_status)
+                await ensure_account(api, username, cookie_string, report_status)
                 destination = output_directory / f"tweet_{tweet_id}_data.json"
                 return await scrape_and_save(api, tweet_id, destination, report_status)
 
@@ -340,8 +347,16 @@ class ScraperApp:
                 event, value = self.events.get_nowait()
             except queue.Empty:
                 break
+            
             if event == "status":
                 self.status.set(value)
+            elif event == "cookies_fetched":
+                self.running = False
+                self.start_button.state(["!disabled"])
+                self.progress.stop()
+                self.cookies.set(value)
+                self.status.set("Cookies retrieved successfully!")
+                messagebox.showinfo("Success", "Browser cookies were captured successfully! You can now start the scrape.", parent=self.root)
             else:
                 self.running = False
                 self.start_button.state(["!disabled"])
@@ -350,8 +365,9 @@ class ScraperApp:
                     self.status.set(f"Saved: {value}")
                     messagebox.showinfo("Scrape complete", f"Results saved to:\n{value}", parent=self.root)
                 else:
-                    self.status.set("The scrape did not complete.")
-                    messagebox.showerror("Scrape failed", value, parent=self.root)
+                    self.status.set("The operation did not complete.")
+                    messagebox.showerror("Failed", value, parent=self.root)
+                    
         self.root.after(100, self._process_events)
 
 
