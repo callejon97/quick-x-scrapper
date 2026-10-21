@@ -1,4 +1,5 @@
 # Tweet Thread Scraper
+[![Build desktop app](https://github.com/callejon97/quick-x-scrapper/actions/workflows/build-app.yml/badge.svg?event=workflow_run)](https://github.com/callejon97/quick-x-scrapper/actions/workflows/build-app.yml)
 
 A small desktop app that exports a post, quote posts, and replies to JSON.
 
